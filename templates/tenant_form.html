@@ -4,7 +4,7 @@
 {% block content %}
 <h1>{{ 'New applicant' if mode == 'new' else 'Edit applicant' }}</h1>
 
-<form method="post" class="card form">
+<form method="post" class="card form" enctype="multipart/form-data">
   <div class="grid-2">
     <label>Full name *
       <input type="text" name="full_name" value="{{ tenant.full_name or '' }}" required>
@@ -22,30 +22,48 @@
     <label>Employer
       <input type="text" name="employer" value="{{ tenant.employer or '' }}">
     </label>
-    <label>Job title
-      <input type="text" name="job_title" value="{{ tenant.job_title or '' }}">
-    </label>
-    <label>Monthly income (USD) *
-      <input type="number" step="0.01" min="0" name="monthly_income"
-             value="{{ tenant.monthly_income or 0 }}" required>
-    </label>
-    <label>Target rent (USD) *
+    <label>Rent (USD) *
       <input type="number" step="0.01" min="0" name="target_rent"
              value="{{ tenant.target_rent or 0 }}" required>
     </label>
-    <label>Bank balance (USD)
-      <input type="number" step="0.01" min="0" name="bank_balance"
-             value="{{ tenant.bank_balance or 0 }}">
-    </label>
-    <label>Credit score
-      <input type="number" min="300" max="850" name="credit_score"
-             value="{{ tenant.credit_score or '' }}">
-    </label>
+
+    {% if mode == 'edit' %}
+      <label>Job title
+        <input type="text" name="job_title" value="{{ tenant.job_title or '' }}">
+      </label>
+      <label>Monthly income (USD)
+        <input type="number" step="0.01" min="0" name="monthly_income"
+               value="{{ tenant.monthly_income or 0 }}">
+      </label>
+      <label>Bank balance (USD)
+        <input type="number" step="0.01" min="0" name="bank_balance"
+               value="{{ tenant.bank_balance or 0 }}">
+      </label>
+      <label>Credit score
+        <input type="number" min="300" max="850" name="credit_score"
+               value="{{ tenant.credit_score or '' }}">
+      </label>
+    {% endif %}
   </div>
 
   <label>Notes
     <textarea name="notes" rows="4">{{ tenant.notes or '' }}</textarea>
   </label>
+
+  {% if mode == 'new' %}
+    <fieldset class="doc-uploads">
+      <legend>Documents <span class="muted small">(optional — you can also add or replace these later)</span></legend>
+      <div class="doc-upload-grid">
+        {% for value, label in doc_types %}
+          <label class="doc-upload-row">
+            <span class="doc-upload-label">{{ label }}</span>
+            <input type="file" name="file_{{ value }}">
+          </label>
+        {% endfor %}
+      </div>
+      <p class="muted small">PDFs are preferred — the system parses the document date and checks that the applicant's name appears in it.</p>
+    </fieldset>
+  {% endif %}
 
   <div class="form-actions">
     <button class="btn primary" type="submit">{{ 'Create applicant' if mode == 'new' else 'Save changes' }}</button>

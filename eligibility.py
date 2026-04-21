@@ -96,7 +96,7 @@ def _check_income(tenant) -> Reason:
     rent = float(tenant.target_rent or 0)
     income = float(tenant.monthly_income or 0)
     if rent <= 0:
-        return Reason("warn", "Target rent is not set — cannot evaluate income coverage.")
+        return Reason("warn", "Rent is not set — cannot evaluate income coverage.")
     ratio = income / rent
     if ratio >= INCOME_TO_RENT_RATIO:
         return Reason("pass", f"Income is {ratio:.1f}× rent (target ≥ {INCOME_TO_RENT_RATIO:.0f}×).")
@@ -124,7 +124,7 @@ def _check_reserve(tenant) -> Reason:
     rent = float(tenant.target_rent or 0)
     balance = float(tenant.bank_balance or 0)
     if rent <= 0:
-        return Reason("warn", "Target rent is not set — cannot evaluate cash reserves.")
+        return Reason("warn", "Rent is not set — cannot evaluate cash reserves.")
     months = balance / rent
     if months >= RESERVE_RATIO_PASS:
         return Reason("pass", f"Bank reserve covers {months:.1f} months of rent.")

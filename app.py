@@ -105,7 +105,7 @@ def _validate_tenant(t: Tenant) -> list[str]:
     if not t.email:
         errors.append("Email is required.")
     if t.target_rent <= 0:
-        errors.append("Target rent must be greater than 0.")
+        errors.append("Rent must be greater than 0.")
     if t.monthly_income < 0:
         errors.append("Monthly income cannot be negative.")
     return errors
@@ -118,6 +118,30 @@ def _delete_file_safely(stored_filename: str, upload_dir: str) -> None:
             full.unlink()
     except OSError:
         pass
+
+
+def _save_and_parse_upload(tenant: Tenant, file, doc_type: str, upload_dir: str) -> Document:
+    original = secure_filename(file.filename)
+    stored = f"{tenant.id}/{uuid.uuid4().hex}_{original}"
+    full_path = Path(upload_dir) / stored
+    full_path.parent.mkdir(parents=True, exist_ok=True)
+    file.save(full_path)
+    size = full_path.stat().st_size
+    result = parse_document(full_path, file.mimetype, tenant.full_name)
+    return Document(
+        tenant_id=tenant.id,
+        doc_type=doc_type,
+        original_filename=original,
+        stored_filename=stored,
+        mime_type=file.mimetype,
+        size_bytes=size,
+        parsed_document_date=result.document_date,
+        parse_status=result.parse_status,
+        parse_note=result.parse_note,
+        name_match_status=result.name_match_status,
+        name_match_score=result.name_match_score,
+        matched_name=result.matched_name,
+    )
 
 
 # --- Routes ---------------------------------------------------------------
@@ -139,12 +163,37 @@ def _register_routes(app: Flask) -> None:
             if errors:
                 for e in errors:
                     flash(e, "error")
-                return render_template("tenant_form.html", tenant=tenant, mode="new")
+                return render_template(
+                    "tenant_form.html", tenant=tenant, mode="new", doc_types=DOCUMENT_TYPES
+                )
             db.session.add(tenant)
             db.session.commit()
-            flash("Applicant created.", "success")
+
+            doc_count = 0
+            skipped: list[str] = []
+            for value, label in DOCUMENT_TYPES:
+                file = request.files.get(f"file_{value}")
+                if not file or not file.filename:
+                    continue
+                if not _allowed(file.filename):
+                    skipped.append(label)
+                    continue
+                doc = _save_and_parse_upload(tenant, file, value, app.config["UPLOAD_DIR"])
+                db.session.add(doc)
+                doc_count += 1
+            if doc_count:
+                db.session.commit()
+
+            msg = "Applicant created."
+            if doc_count:
+                msg += f" {doc_count} document{'s' if doc_count != 1 else ''} uploaded."
+            flash(msg, "success")
+            if skipped:
+                flash(f"Skipped unsupported file type for: {', '.join(skipped)}.", "error")
             return redirect(url_for("tenant_detail", tenant_id=tenant.id))
-        return render_template("tenant_form.html", tenant=Tenant(), mode="new")
+        return render_template(
+            "tenant_form.html", tenant=Tenant(), mode="new", doc_types=DOCUMENT_TYPES
+        )
 
     @app.route("/tenants/<int:tenant_id>/edit", methods=["GET", "POST"])
     def edit_tenant(tenant_id: int):
@@ -195,29 +244,7 @@ def _register_routes(app: Flask) -> None:
             flash("Unsupported file type.", "error")
             return redirect(url_for("tenant_detail", tenant_id=tenant_id))
 
-        original = secure_filename(file.filename)
-        stored = f"{tenant.id}/{uuid.uuid4().hex}_{original}"
-        full_path = Path(app.config["UPLOAD_DIR"]) / stored
-        full_path.parent.mkdir(parents=True, exist_ok=True)
-        file.save(full_path)
-        size = full_path.stat().st_size
-
-        result = parse_document(full_path, file.mimetype, tenant.full_name)
-
-        doc = Document(
-            tenant_id=tenant.id,
-            doc_type=doc_type,
-            original_filename=original,
-            stored_filename=stored,
-            mime_type=file.mimetype,
-            size_bytes=size,
-            parsed_document_date=result.document_date,
-            parse_status=result.parse_status,
-            parse_note=result.parse_note,
-            name_match_status=result.name_match_status,
-            name_match_score=result.name_match_score,
-            matched_name=result.matched_name,
-        )
+        doc = _save_and_parse_upload(tenant, file, doc_type, app.config["UPLOAD_DIR"])
         db.session.add(doc)
         db.session.commit()
         flash("Document uploaded.", "success")
