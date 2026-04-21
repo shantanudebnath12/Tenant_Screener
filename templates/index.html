@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Applicants — Tenant Screener{% endblock %}
+
+{% block content %}
+<h1>Applicants</h1>
+
+{% if not rows %}
+  <div class="empty-state">
+    <p>No applicants yet.</p>
+    <a class="btn primary" href="{{ url_for('new_tenant') }}">Add your first applicant</a>
+  </div>
+{% else %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Email</th>
+        <th>Target rent</th>
+        <th>Income</th>
+        <th>Income / rent</th>
+        <th>Credit</th>
+        <th>Documents</th>
+        <th>Verdict</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for tenant, verdict in rows %}
+        {% set ratio = (tenant.monthly_income / tenant.target_rent) if tenant.target_rent else 0 %}
+        <tr>
+          <td><a href="{{ url_for('tenant_detail', tenant_id=tenant.id) }}">{{ tenant.full_name }}</a></td>
+          <td>{{ tenant.email }}</td>
+          <td>{{ tenant.target_rent | money }}</td>
+          <td>{{ tenant.monthly_income | money }}</td>
+          <td>{{ '%.1f'|format(ratio) }}×</td>
+          <td>{{ tenant.credit_score or '—' }}</td>
+          <td>{{ tenant.documents | length }}</td>
+          <td><span class="pill pill-{{ verdict.label | lower }}">{{ verdict.label }}</span></td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}

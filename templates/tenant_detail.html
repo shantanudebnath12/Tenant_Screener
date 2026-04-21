@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+{% block title %}{{ tenant.full_name }} — Tenant Screener{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>{{ tenant.full_name }}</h1>
+    <p class="muted">{{ tenant.email }}{% if tenant.phone %} · {{ tenant.phone }}{% endif %}</p>
+  </div>
+  <div class="page-header-actions">
+    <a class="btn" href="{{ url_for('edit_tenant', tenant_id=tenant.id) }}">Edit</a>
+    <form method="post" action="{{ url_for('delete_tenant', tenant_id=tenant.id) }}"
+          onsubmit="return confirm('Delete this applicant and all their documents?');">
+      <button class="btn danger" type="submit">Delete</button>
+    </form>
+  </div>
+</div>
+
+<section class="card verdict-card verdict-{{ verdict.label | lower }}">
+  <div class="verdict-headline">
+    <span class="pill pill-{{ verdict.label | lower }}">{{ verdict.label }}</span>
+    <span class="muted">
+      {{ verdict.passes | length }} pass · {{ verdict.warns | length }} warn · {{ verdict.fails | length }} fail
+    </span>
+  </div>
+  <ul class="reason-list">
+    {% for reason in verdict.reasons %}
+      <li class="reason reason-{{ reason.level }}">
+        <span class="reason-tag">{{ reason.level | upper }}</span>
+        {{ reason.message }}
+      </li>
+    {% endfor %}
+  </ul>
+</section>
+
+<div class="two-col">
+  <section class="card">
+    <h2>Applicant info</h2>
+    <dl class="info-grid">
+      <dt>Employer</dt><dd>{{ tenant.employer or '—' }}</dd>
+      <dt>Job title</dt><dd>{{ tenant.job_title or '—' }}</dd>
+      <dt>Monthly income</dt><dd>{{ tenant.monthly_income | money }}</dd>
+      <dt>Target rent</dt><dd>{{ tenant.target_rent | money }}</dd>
+      <dt>Bank balance</dt><dd>{{ tenant.bank_balance | money }}</dd>
+      <dt>Credit score</dt><dd>{{ tenant.credit_score or '—' }}</dd>
+      <dt>Move-in date</dt><dd>{{ tenant.move_in_date | date_or_dash }}</dd>
+    </dl>
+    {% if tenant.notes %}
+      <h3>Notes</h3>
+      <p class="notes">{{ tenant.notes }}</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>Upload document</h2>
+    <form method="post" action="{{ url_for('upload_document', tenant_id=tenant.id) }}"
+          enctype="multipart/form-data" class="form upload-form">
+      <label>Document type
+        <select name="doc_type" required>
+          {% for value, label in doc_types %}
+            <option value="{{ value }}">{{ label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>File (PDF preferred for date / name parsing)
+        <input type="file" name="file" required>
+      </label>
+      <button class="btn primary" type="submit">Upload</button>
+    </form>
+  </section>
+</div>
+
+<section class="card">
+  <h2>Documents</h2>
+  {% if not tenant.documents %}
+    <p class="muted">No documents uploaded yet.</p>
+  {% else %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>File</th>
+          <th>Document date</th>
+          <th>Name match</th>
+          <th>Parse</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for doc in tenant.documents %}
+          <tr>
+            <td>{{ doc.type_label }}</td>
+            <td>
+              <a href="{{ url_for('download_document', doc_id=doc.id) }}">{{ doc.original_filename }}</a>
+              <div class="muted small">{{ doc.uploaded_at.strftime('%b %d, %Y %H:%M') }}</div>
+            </td>
+            <td>
+              <form method="post" action="{{ url_for('update_document_date', doc_id=doc.id) }}" class="inline-form">
+                <input type="date" name="manual_document_date"
+                       value="{{ (doc.manual_document_date or doc.parsed_document_date).isoformat() if doc.effective_date else '' }}">
+                <button class="btn small" type="submit">Save</button>
+              </form>
+              {% if doc.parsed_document_date and not doc.manual_document_date %}
+                <div class="muted small">Auto: {{ doc.parsed_document_date | date_or_dash }}</div>
+              {% elif doc.manual_document_date and doc.parsed_document_date %}
+                <div class="muted small">Auto was: {{ doc.parsed_document_date | date_or_dash }}</div>
+              {% endif %}
+            </td>
+            <td>
+              <span class="pill pill-name-{{ doc.name_match_status }}">
+                {{ doc.name_match_status | replace('_', ' ') }}
+                {% if doc.name_match_score is not none %} · {{ '%.2f'|format(doc.name_match_score) }}{% endif %}
+              </span>
+              {% if doc.matched_name %}
+                <div class="muted small">Matched: "{{ doc.matched_name }}"</div>
+              {% endif %}
+              <form method="post" action="{{ url_for('confirm_document_name', doc_id=doc.id) }}" class="inline-form">
+                <label class="checkbox small">
+                  <input type="checkbox" name="confirmed" value="1"
+                         {% if doc.name_manually_confirmed %}checked{% endif %}
+                         onchange="this.form.submit()">
+                  Confirmed manually
+                </label>
+              </form>
+            </td>
+            <td>
+              <span class="pill pill-parse-{{ doc.parse_status }}">{{ doc.parse_status }}</span>
+              {% if doc.parse_note %}
+                <div class="muted small">{{ doc.parse_note }}</div>
+              {% endif %}
+            </td>
+            <td class="actions">
+              <form method="post" action="{{ url_for('reparse_document', doc_id=doc.id) }}" class="inline-form">
+                <button class="btn small" type="submit">Re-parse</button>
+              </form>
+              <form method="post" action="{{ url_for('delete_document', doc_id=doc.id) }}" class="inline-form"
+                    onsubmit="return confirm('Delete this document?');">
+                <button class="btn small danger" type="submit">Delete</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</section>
+{% endblock %}

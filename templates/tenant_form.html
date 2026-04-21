@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}{{ 'New' if mode == 'new' else 'Edit' }} applicant — Tenant Screener{% endblock %}
+
+{% block content %}
+<h1>{{ 'New applicant' if mode == 'new' else 'Edit applicant' }}</h1>
+
+<form method="post" class="card form">
+  <div class="grid-2">
+    <label>Full name *
+      <input type="text" name="full_name" value="{{ tenant.full_name or '' }}" required>
+    </label>
+    <label>Email *
+      <input type="email" name="email" value="{{ tenant.email or '' }}" required>
+    </label>
+    <label>Phone
+      <input type="tel" name="phone" value="{{ tenant.phone or '' }}">
+    </label>
+    <label>Move-in date
+      <input type="date" name="move_in_date"
+             value="{{ tenant.move_in_date.isoformat() if tenant.move_in_date else '' }}">
+    </label>
+    <label>Employer
+      <input type="text" name="employer" value="{{ tenant.employer or '' }}">
+    </label>
+    <label>Job title
+      <input type="text" name="job_title" value="{{ tenant.job_title or '' }}">
+    </label>
+    <label>Monthly income (USD) *
+      <input type="number" step="0.01" min="0" name="monthly_income"
+             value="{{ tenant.monthly_income or 0 }}" required>
+    </label>
+    <label>Target rent (USD) *
+      <input type="number" step="0.01" min="0" name="target_rent"
+             value="{{ tenant.target_rent or 0 }}" required>
+    </label>
+    <label>Bank balance (USD)
+      <input type="number" step="0.01" min="0" name="bank_balance"
+             value="{{ tenant.bank_balance or 0 }}">
+    </label>
+    <label>Credit score
+      <input type="number" min="300" max="850" name="credit_score"
+             value="{{ tenant.credit_score or '' }}">
+    </label>
+  </div>
+
+  <label>Notes
+    <textarea name="notes" rows="4">{{ tenant.notes or '' }}</textarea>
+  </label>
+
+  <div class="form-actions">
+    <button class="btn primary" type="submit">{{ 'Create applicant' if mode == 'new' else 'Save changes' }}</button>
+    <a class="btn" href="{{ url_for('tenant_detail', tenant_id=tenant.id) if tenant.id else url_for('index') }}">Cancel</a>
+  </div>
+</form>
+{% endblock %}
