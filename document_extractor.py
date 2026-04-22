@@ -30,6 +30,8 @@ log = logging.getLogger(__name__)
 MAX_PAGES = 3
 IMAGE_DPI = 150
 
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+
 FUZZY_MATCH = 0.85
 PARTIAL_MATCH = 0.70
 
@@ -198,13 +200,13 @@ def extract_document(
         return _fallback(path, mime_type, tenant_name, reason="No API key configured.")
 
     try:
-        images = _render_pdf_pages(path, max_pages=MAX_PAGES)
+        images = _render_document_to_images(path, mime_type, max_pages=MAX_PAGES)
     except Exception as exc:
-        log.exception("Failed to render PDF pages: %s", exc)
-        return _fallback(path, mime_type, tenant_name, reason=f"Could not render PDF: {exc}")
+        log.exception("Failed to render document: %s", exc)
+        return _fallback(path, mime_type, tenant_name, reason=f"Could not render document: {exc}")
 
     if not images:
-        return _fallback(path, mime_type, tenant_name, reason="No renderable pages in PDF.")
+        return _fallback(path, mime_type, tenant_name, reason="No renderable content.")
 
     try:
         raw = _call_openai(images, tenant_name)
@@ -219,7 +221,17 @@ def extract_document(
 
 
 def _is_supported(path: Path, mime_type: str | None) -> bool:
-    return (mime_type == "application/pdf") or path.suffix.lower() == ".pdf"
+    ext = path.suffix.lower()
+    if ext == ".pdf" or mime_type == "application/pdf":
+        return True
+    if ext in IMAGE_EXTENSIONS or (mime_type and mime_type.startswith("image/")):
+        return True
+    return False
+
+
+def _is_image(path: Path, mime_type: str | None) -> bool:
+    ext = path.suffix.lower()
+    return ext in IMAGE_EXTENSIONS or (mime_type or "").startswith("image/")
 
 
 def _unsupported_result() -> ExtractionResult:
@@ -234,7 +246,18 @@ def _unsupported_result() -> ExtractionResult:
 
 
 def _fallback(path: Path, mime_type: str | None, tenant_name: str, reason: str) -> ExtractionResult:
-    # Use the deterministic parser; attach the fallback reason to the note.
+    # Images can't be parsed deterministically (no OCR) — mark unsupported.
+    if _is_image(path, mime_type):
+        return ExtractionResult(
+            document_date=None,
+            parse_status="unsupported",
+            parse_note=f"{reason} Image files can only be auto-read with the LLM extractor.",
+            name_match_status="unknown",
+            name_match_score=None,
+            matched_name=None,
+        )
+
+    # PDF: use the deterministic regex parser; attach the fallback reason.
     from document_parser import parse_document
 
     base = parse_document(path, mime_type, tenant_name)
@@ -253,10 +276,26 @@ def _fallback(path: Path, mime_type: str | None, tenant_name: str, reason: str) 
     )
 
 
-def _render_pdf_pages(path: Path, max_pages: int) -> list[bytes]:
+def _render_document_to_images(
+    path: Path, mime_type: str | None, max_pages: int
+) -> list[tuple[bytes, str]]:
+    """Return a list of (bytes, mime_type) tuples ready for the vision API.
+
+    PDFs are rasterized one page per tuple; image files are passed through.
+    """
+    if _is_image(path, mime_type):
+        ext = path.suffix.lower().lstrip(".")
+        resolved = mime_type or {
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+            "webp": "image/webp",
+        }.get(ext, "image/png")
+        return [(path.read_bytes(), resolved)]
+
     import fitz  # PyMuPDF
 
-    images: list[bytes] = []
+    images: list[tuple[bytes, str]] = []
     with fitz.open(str(path)) as doc:
         for i, page in enumerate(doc):
             if i >= max_pages:
@@ -264,11 +303,11 @@ def _render_pdf_pages(path: Path, max_pages: int) -> list[bytes]:
             zoom = IMAGE_DPI / 72  # 72 is the PDF default DPI
             matrix = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=matrix, alpha=False)
-            images.append(pix.tobytes("png"))
+            images.append((pix.tobytes("png"), "image/png"))
     return images
 
 
-def _call_openai(images: list[bytes], tenant_name: str) -> dict[str, Any]:
+def _call_openai(images: list[tuple[bytes, str]], tenant_name: str) -> dict[str, Any]:
     from openai import OpenAI
 
     client = OpenAI()
@@ -293,12 +332,12 @@ def _call_openai(images: list[bytes], tenant_name: str) -> dict[str, Any]:
             ),
         }
     ]
-    for img_bytes in images:
+    for img_bytes, img_mime in images:
         b64 = base64.b64encode(img_bytes).decode("ascii")
         user_content.append(
             {
                 "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64}"},
+                "image_url": {"url": f"data:{img_mime};base64,{b64}"},
             }
         )
 
