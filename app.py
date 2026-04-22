@@ -7,6 +7,7 @@ import uuid
 from datetime import date, datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
 from flask import (
     Flask,
     abort,
@@ -19,8 +20,10 @@ from flask import (
 )
 from werkzeug.utils import secure_filename
 
+load_dotenv()  # Load OPENAI_API_KEY and friends from .env before anything else.
+
 import eligibility
-from document_parser import parse_document
+from document_extractor import extract_document
 from models import DOCUMENT_TYPES, Document, Tenant, db
 
 
@@ -127,7 +130,7 @@ def _save_and_parse_upload(tenant: Tenant, file, doc_type: str, upload_dir: str)
     full_path.parent.mkdir(parents=True, exist_ok=True)
     file.save(full_path)
     size = full_path.stat().st_size
-    result = parse_document(full_path, file.mimetype, tenant.full_name)
+    result = extract_document(full_path, file.mimetype, tenant.full_name)
     return Document(
         tenant_id=tenant.id,
         doc_type=doc_type,
@@ -141,7 +144,38 @@ def _save_and_parse_upload(tenant: Tenant, file, doc_type: str, upload_dir: str)
         name_match_status=result.name_match_status,
         name_match_score=result.name_match_score,
         matched_name=result.matched_name,
+        document_type_predicted=result.document_type_predicted,
+        issuer=result.issuer,
+        extraction_confidence=result.extraction_confidence,
+        extracted_values_json=result.extracted_values_json,
     )
+
+
+def _refresh_tenant_from_documents(tenant: Tenant) -> None:
+    """Pull monthly_income / bank_balance / credit_score from the most recent
+    document of each relevant type. Last-upload-wins per type."""
+
+    def latest_of(doc_type: str):
+        docs = [d for d in tenant.documents if d.doc_type == doc_type]
+        return max(docs, key=lambda d: d.uploaded_at) if docs else None
+
+    pay_stub = latest_of("pay_stub")
+    if pay_stub:
+        value = pay_stub.extracted_values.get("gross_monthly_income")
+        if isinstance(value, (int, float)) and value > 0:
+            tenant.monthly_income = float(value)
+
+    bank = latest_of("bank_statement")
+    if bank:
+        value = bank.extracted_values.get("closing_balance")
+        if isinstance(value, (int, float)):
+            tenant.bank_balance = float(value)
+
+    credit = latest_of("credit_report")
+    if credit:
+        value = credit.extracted_values.get("credit_score")
+        if isinstance(value, int) and 300 <= value <= 900:
+            tenant.credit_score = value
 
 
 # --- Routes ---------------------------------------------------------------
@@ -182,6 +216,8 @@ def _register_routes(app: Flask) -> None:
                 db.session.add(doc)
                 doc_count += 1
             if doc_count:
+                db.session.flush()  # assign doc IDs so the relationship is populated
+                _refresh_tenant_from_documents(tenant)
                 db.session.commit()
 
             msg = "Applicant created."
@@ -246,6 +282,8 @@ def _register_routes(app: Flask) -> None:
 
         doc = _save_and_parse_upload(tenant, file, doc_type, app.config["UPLOAD_DIR"])
         db.session.add(doc)
+        db.session.flush()
+        _refresh_tenant_from_documents(tenant)
         db.session.commit()
         flash("Document uploaded.", "success")
         return redirect(url_for("tenant_detail", tenant_id=tenant.id))
@@ -273,13 +311,18 @@ def _register_routes(app: Flask) -> None:
         if not full_path.exists():
             flash("File missing on disk; cannot re-parse.", "error")
             return redirect(url_for("tenant_detail", tenant_id=doc.tenant_id))
-        result = parse_document(full_path, doc.mime_type, doc.tenant.full_name)
+        result = extract_document(full_path, doc.mime_type, doc.tenant.full_name)
         doc.parsed_document_date = result.document_date
         doc.parse_status = result.parse_status
         doc.parse_note = result.parse_note
         doc.name_match_status = result.name_match_status
         doc.name_match_score = result.name_match_score
         doc.matched_name = result.matched_name
+        doc.document_type_predicted = result.document_type_predicted
+        doc.issuer = result.issuer
+        doc.extraction_confidence = result.extraction_confidence
+        doc.extracted_values_json = result.extracted_values_json
+        _refresh_tenant_from_documents(doc.tenant)
         db.session.commit()
         flash("Document re-parsed.", "success")
         return redirect(url_for("tenant_detail", tenant_id=doc.tenant_id))

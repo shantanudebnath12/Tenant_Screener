@@ -27,15 +27,17 @@ Jinja templates · single hand-written CSS file. **No build step, no JS framewor
 
 | File | Purpose |
 |---|---|
-| `app.py` | Flask app factory + all routes + small template filters |
-| `models.py` | `Tenant` and `Document` SQLAlchemy models; `DOCUMENT_TYPES` enum |
-| `document_parser.py` | PDF text extraction, date regex + `dateutil` parsing, name matching via `difflib.SequenceMatcher` |
+| `app.py` | Flask app factory + all routes + small template filters. Loads `.env` on startup. |
+| `models.py` | `Tenant` and `Document` SQLAlchemy models; `DOCUMENT_TYPES` enum. `Document` now stores extracted values from the LLM. |
+| `document_extractor.py` | **Primary extractor.** Renders PDF pages to images via PyMuPDF, sends to OpenAI (`gpt-4o-mini`) with a strict JSON-schema structured output. Extracts doc type, date, name, issuer, and financial figures (income, balance, credit score, ID expiry). Falls back to `document_parser` on failure. |
+| `document_parser.py` | **Deterministic fallback.** PDF text extraction + regex date parsing + `SequenceMatcher` name match. Used when `OPENAI_API_KEY` is missing or the API call fails. |
 | `eligibility.py` | Rules engine. **All thresholds are constants at the top of the file** |
 | `templates/base.html` | Layout, flash messages, top nav |
 | `templates/index.html` | Dashboard: applicants table with verdict pill |
-| `templates/tenant_form.html` | New / edit applicant form |
-| `templates/tenant_detail.html` | Info, documents table, verdict panel, upload form |
-| `static/style.css` | Single CSS file, ~200 lines. Verdict pills are color-coded |
+| `templates/tenant_form.html` | New / edit applicant form (create form has doc upload slots; edit form has all numeric fields) |
+| `templates/tenant_detail.html` | Info, documents table (with extracted-values drop-down), verdict panel, upload form |
+| `static/style.css` | Single CSS file. Verdict, confidence, and name-match pills are color-coded |
+| `.env` | `OPENAI_API_KEY` + `OPENAI_MODEL`. Gitignored. Copy from `.env.example`. |
 | `instance/tenants.db` | SQLite DB (gitignored, created on first run) |
 | `uploads/<tenant_id>/<uuid>_<name>` | Uploaded files (gitignored) |
 
@@ -48,14 +50,29 @@ Jinja templates · single hand-written CSS file. **No build step, no JS framewor
 - **No auth.** Single-user / local-trust app. Adding Flask-Login is a future step if needed.
 - **No tests yet.** Smoke-tested by hand and via inline scripts at build time. Adding pytest is a clear next step.
 
-## How parsing works (`document_parser.py`)
+## How extraction works
 
-`parse_document(file_path, mime_type, tenant_name) -> ParseResult`:
+There are two layers. `document_extractor.extract_document(path, mime, tenant_name)` is the entry point called by every upload/reparse route.
 
-1. If not a PDF → return `unsupported` / `unknown`. Done.
-2. Extract text with `pdfplumber` (text-layer only — no OCR).
-3. **Date:** run a set of regexes for common formats (US slash, ISO, "Month DD, YYYY", "DD Month YYYY"), parse each candidate with `dateutil`, filter to a plausible window (5 years past → 30 days future), return the **most recent**.
-4. **Name:** normalize both the tenant name and the extracted text (lowercase, strip punctuation, collapse whitespace). Try variants: full name, `first last`, `last first`. Exact substring → `match`. Otherwise sliding-window `SequenceMatcher` ratio: ≥0.85 → `fuzzy`, 0.70–0.85 → `partial`, else `no_match`.
+### Primary: LLM extractor (`document_extractor.py`)
+
+1. Render up to `MAX_PAGES` (default 3) of the PDF to PNG via PyMuPDF (`fitz`) at 150 DPI. No OCR, no poppler — PyMuPDF handles both text and scanned PDFs by rasterizing them.
+2. Base64-encode the images and send to OpenAI chat completions with `response_format={"type": "json_schema", "json_schema": EXTRACTION_SCHEMA, "strict": true}`. Schema is in `EXTRACTION_SCHEMA` at the top of the file.
+3. The model returns exactly the schema fields: `document_type`, `document_date` (ISO), `date_label`, `name_on_document`, `issuer`, per-doc-type figures (`gross_monthly_income`, `closing_balance`, `credit_score`, `id_expiration_date`, …), `confidence` (high/medium/low), `notes`.
+4. **Name match is not delegated to the LLM.** We take the LLM's `name_on_document` and run `SequenceMatcher` against the tenant's full name ourselves — deterministic, inspectable, not subject to "is this the same person?" hallucination.
+
+### Fallback: deterministic parser (`document_parser.py`)
+
+Used automatically when `OPENAI_API_KEY` is missing or the API call fails. Same contract. PDF text via `pdfplumber`, date regex + `dateutil`, name match via `SequenceMatcher` sliding window. The note on the document row tells you which path ran.
+
+### Auto-population of tenant fields
+
+After every upload/reparse, `app._refresh_tenant_from_documents(tenant)` reads the latest document of each relevant type and pulls values into the Tenant record:
+- Pay stub `gross_monthly_income` → `tenant.monthly_income`
+- Bank statement `closing_balance` → `tenant.bank_balance`
+- Credit report `credit_score` → `tenant.credit_score`
+
+Last-upload-wins per doc type. The user can still override any value on the edit form.
 
 ## How eligibility works (`eligibility.py`)
 
@@ -107,8 +124,10 @@ Push went through after the user granted the Claude GitHub App write access on
 
 ## Likely next steps (not yet done)
 
-- OCR for image-only PDFs and image uploads (pytesseract)
-- Pytest suite, especially around `document_parser` and `eligibility`
+- Pytest suite, especially around `document_extractor`, `document_parser`, and `eligibility`
+- Cost / latency tracking per extraction call
+- Retry logic for transient OpenAI errors (currently fails straight to fallback)
+- Surface `document_type_predicted` mismatches more prominently in the UI (already shows a ⚠ line)
 - Authentication / multi-user
 - Email-the-applicant flow
 - Bulk export (PDF / CSV) of an applicant's screening report

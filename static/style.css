@@ -251,3 +251,13 @@ h3 { font-size: 14px; margin: 16px 0 8px; }
   padding: 4px 0;
   font-size: 12px;
 }
+
+.pill-conf-high   { background: var(--pass-bg); color: var(--pass); }
+.pill-conf-medium { background: var(--warn-bg); color: var(--warn); }
+.pill-conf-low    { background: var(--fail-bg); color: var(--fail); }
+
+.warn-text { color: var(--warn); margin-top: 4px; }
+
+.extracted-details { margin-top: 6px; }
+.extracted-details ul { margin: 4px 0 0 16px; padding: 0; }
+.extracted-details li { margin-bottom: 2px; }

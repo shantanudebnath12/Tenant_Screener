@@ -68,6 +68,12 @@ class Document(db.Model):
     matched_name = db.Column(db.String(300))  # snippet that matched, for display
     name_manually_confirmed = db.Column(db.Boolean, default=False)
 
+    # LLM extraction enrichment (null if the extractor didn't run).
+    document_type_predicted = db.Column(db.String(50))  # what the LLM thinks the doc is
+    issuer = db.Column(db.String(200))  # bank / employer / credit bureau
+    extraction_confidence = db.Column(db.String(20))  # high | medium | low
+    extracted_values_json = db.Column(db.Text)  # raw JSON blob from the extractor
+
     @property
     def effective_date(self):
         return self.manual_document_date or self.parsed_document_date
@@ -75,3 +81,14 @@ class Document(db.Model):
     @property
     def type_label(self):
         return DOCUMENT_TYPE_LABELS.get(self.doc_type, self.doc_type)
+
+    @property
+    def extracted_values(self):
+        if not self.extracted_values_json:
+            return {}
+        import json as _json
+
+        try:
+            return _json.loads(self.extracted_values_json)
+        except (TypeError, ValueError):
+            return {}

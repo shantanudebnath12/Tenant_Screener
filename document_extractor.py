@@ -1,0 +1,404 @@
+"""LLM-based document extractor.
+
+Sends rendered PDF pages to OpenAI's vision model and asks for a structured
+extraction (document type, date, name on document, issuer, key financial
+figures). Used for format-agnostic reading of bank statements, pay stubs,
+credit reports, IDs, and offer letters — avoiding per-format regex.
+
+Falls back to the deterministic parser (``document_parser.parse_document``)
+when the API key is missing or the call fails.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import os
+import string
+from dataclasses import dataclass
+from datetime import date, datetime
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+# Maximum pages to send to the model per document. Financial statements put
+# the summary on page 1; additional pages are mostly transaction rows that
+# don't help date / name / balance extraction and just add token cost.
+MAX_PAGES = 3
+IMAGE_DPI = 150
+
+FUZZY_MATCH = 0.85
+PARTIAL_MATCH = 0.70
+
+_PUNCT_TABLE = str.maketrans("", "", string.punctuation)
+
+
+# --- Extraction schema ----------------------------------------------------
+
+# Strict JSON schema passed to OpenAI structured outputs. The model is
+# required to emit exactly these fields — no extras, no missing keys.
+EXTRACTION_SCHEMA: dict[str, Any] = {
+    "name": "document_extraction",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "document_type",
+            "document_date",
+            "date_label",
+            "name_on_document",
+            "issuer",
+            "gross_monthly_income",
+            "net_pay_this_period",
+            "pay_period",
+            "closing_balance",
+            "average_balance",
+            "credit_score",
+            "id_expiration_date",
+            "confidence",
+            "notes",
+        ],
+        "properties": {
+            "document_type": {
+                "type": "string",
+                "enum": [
+                    "pay_stub",
+                    "bank_statement",
+                    "credit_report",
+                    "id",
+                    "offer_letter",
+                    "other",
+                    "unknown",
+                ],
+                "description": "What kind of document this is.",
+            },
+            "document_date": {
+                "type": ["string", "null"],
+                "description": (
+                    "The most meaningful date on the document in ISO format "
+                    "(YYYY-MM-DD). For a bank statement use the closing / "
+                    "statement date. For a pay stub use the pay date. For a "
+                    "credit report use the date issued / pulled. For an ID "
+                    "use the issue date (not expiration). Null if not found."
+                ),
+            },
+            "date_label": {
+                "type": ["string", "null"],
+                "description": (
+                    "The label or phrase next to the date you chose (e.g. "
+                    "'Closing Balance on', 'Pay date', 'Date issued')."
+                ),
+            },
+            "name_on_document": {
+                "type": ["string", "null"],
+                "description": "Primary person named on the document. Null if not found.",
+            },
+            "issuer": {
+                "type": ["string", "null"],
+                "description": "Bank / employer / credit bureau that issued the document.",
+            },
+            "gross_monthly_income": {
+                "type": ["number", "null"],
+                "description": (
+                    "For pay stubs only: estimated gross MONTHLY income. If "
+                    "the stub shows bi-weekly or weekly, convert to monthly "
+                    "(bi-weekly × 2.1667, weekly × 4.333). Null otherwise."
+                ),
+            },
+            "net_pay_this_period": {
+                "type": ["number", "null"],
+                "description": "Pay stubs only: net pay for this period, unconverted.",
+            },
+            "pay_period": {
+                "type": ["string", "null"],
+                "enum": ["weekly", "bi-weekly", "semi-monthly", "monthly", None],
+                "description": "Pay stubs only: frequency of pay.",
+            },
+            "closing_balance": {
+                "type": ["number", "null"],
+                "description": "Bank statement only: closing / ending balance.",
+            },
+            "average_balance": {
+                "type": ["number", "null"],
+                "description": "Bank statement only: average daily balance if shown.",
+            },
+            "credit_score": {
+                "type": ["integer", "null"],
+                "description": "Credit report only: primary credit score (300-900 range).",
+            },
+            "id_expiration_date": {
+                "type": ["string", "null"],
+                "description": "ID only: expiration date in ISO format.",
+            },
+            "confidence": {
+                "type": "string",
+                "enum": ["high", "medium", "low"],
+                "description": (
+                    "Your confidence in this extraction. 'low' when the image "
+                    "is hard to read, dates are ambiguous, or key fields are "
+                    "missing."
+                ),
+            },
+            "notes": {
+                "type": "string",
+                "description": "One short sentence about the extraction. Empty string if nothing notable.",
+            },
+        },
+    },
+}
+
+
+# --- Result object --------------------------------------------------------
+
+
+@dataclass
+class ExtractionResult:
+    # Core fields used by the eligibility engine and UI.
+    document_date: date | None
+    parse_status: str  # ok | failed | unsupported
+    parse_note: str
+    name_match_status: str  # match | fuzzy | partial | no_match | unknown
+    name_match_score: float | None
+    matched_name: str | None
+
+    # LLM-enriched fields.
+    document_type_predicted: str | None = None
+    issuer: str | None = None
+    extraction_confidence: str | None = None  # high | medium | low
+    extracted_values_json: str | None = None  # JSON blob of the full LLM response
+
+    @property
+    def extracted_values(self) -> dict[str, Any]:
+        if not self.extracted_values_json:
+            return {}
+        try:
+            return json.loads(self.extracted_values_json)
+        except (TypeError, ValueError):
+            return {}
+
+
+# --- Public API -----------------------------------------------------------
+
+
+def extract_document(
+    file_path: str | Path, mime_type: str | None, tenant_name: str
+) -> ExtractionResult:
+    """Extract structured data from a document via OpenAI, with deterministic fallback."""
+    path = Path(file_path)
+
+    if not _is_supported(path, mime_type):
+        return _unsupported_result()
+
+    if not os.environ.get("OPENAI_API_KEY"):
+        log.info("OPENAI_API_KEY not set — falling back to deterministic parser.")
+        return _fallback(path, mime_type, tenant_name, reason="No API key configured.")
+
+    try:
+        images = _render_pdf_pages(path, max_pages=MAX_PAGES)
+    except Exception as exc:
+        log.exception("Failed to render PDF pages: %s", exc)
+        return _fallback(path, mime_type, tenant_name, reason=f"Could not render PDF: {exc}")
+
+    if not images:
+        return _fallback(path, mime_type, tenant_name, reason="No renderable pages in PDF.")
+
+    try:
+        raw = _call_openai(images, tenant_name)
+    except Exception as exc:
+        log.exception("OpenAI call failed: %s", exc)
+        return _fallback(path, mime_type, tenant_name, reason=f"LLM extraction failed: {exc}")
+
+    return _result_from_llm(raw, tenant_name)
+
+
+# --- Internals ------------------------------------------------------------
+
+
+def _is_supported(path: Path, mime_type: str | None) -> bool:
+    return (mime_type == "application/pdf") or path.suffix.lower() == ".pdf"
+
+
+def _unsupported_result() -> ExtractionResult:
+    return ExtractionResult(
+        document_date=None,
+        parse_status="unsupported",
+        parse_note="Only PDFs are auto-extracted. Set the date and confirm the name manually.",
+        name_match_status="unknown",
+        name_match_score=None,
+        matched_name=None,
+    )
+
+
+def _fallback(path: Path, mime_type: str | None, tenant_name: str, reason: str) -> ExtractionResult:
+    # Use the deterministic parser; attach the fallback reason to the note.
+    from document_parser import parse_document
+
+    base = parse_document(path, mime_type, tenant_name)
+    note = f"{reason} Using deterministic parser. {base.parse_note}".strip()
+    return ExtractionResult(
+        document_date=base.document_date,
+        parse_status=base.parse_status,
+        parse_note=note,
+        name_match_status=base.name_match_status,
+        name_match_score=base.name_match_score,
+        matched_name=base.matched_name,
+        document_type_predicted=None,
+        issuer=None,
+        extraction_confidence=None,
+        extracted_values_json=None,
+    )
+
+
+def _render_pdf_pages(path: Path, max_pages: int) -> list[bytes]:
+    import fitz  # PyMuPDF
+
+    images: list[bytes] = []
+    with fitz.open(str(path)) as doc:
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                break
+            zoom = IMAGE_DPI / 72  # 72 is the PDF default DPI
+            matrix = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            images.append(pix.tobytes("png"))
+    return images
+
+
+def _call_openai(images: list[bytes], tenant_name: str) -> dict[str, Any]:
+    from openai import OpenAI
+
+    client = OpenAI()
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+    system_prompt = (
+        "You read tenant-screening documents (pay stubs, bank statements, credit "
+        "reports, IDs, offer letters) and extract a strict JSON object. Be "
+        "precise with dates and amounts. Use ISO-8601 (YYYY-MM-DD) for all "
+        "dates. If a field is not clearly present, return null — do not "
+        "guess. If the document is hard to read, set confidence to 'low'."
+    )
+
+    user_content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                f"Applicant name (for context only; don't validate here): {tenant_name}\n\n"
+                "Extract the fields defined by the schema. Remember to choose the "
+                "SINGLE most meaningful document date (e.g. closing date for a "
+                "bank statement, pay date for a pay stub)."
+            ),
+        }
+    ]
+    for img_bytes in images:
+        b64 = base64.b64encode(img_bytes).decode("ascii")
+        user_content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{b64}"},
+            }
+        )
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        response_format={"type": "json_schema", "json_schema": EXTRACTION_SCHEMA},
+        temperature=0,
+    )
+    content = response.choices[0].message.content
+    if not content:
+        raise RuntimeError("OpenAI returned empty content.")
+    return json.loads(content)
+
+
+def _result_from_llm(raw: dict[str, Any], tenant_name: str) -> ExtractionResult:
+    # Parse the document date.
+    doc_date: date | None = None
+    raw_date = raw.get("document_date")
+    if raw_date:
+        try:
+            doc_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+        except ValueError:
+            doc_date = None
+
+    if doc_date is None:
+        parse_status = "failed"
+        parse_note = "LLM did not return a date."
+    else:
+        label = raw.get("date_label") or ""
+        parse_note = f"Extracted date: {doc_date.isoformat()}"
+        if label:
+            parse_note += f" (labelled '{label}')"
+        parse_status = "ok"
+
+    confidence = raw.get("confidence")
+    notes = raw.get("notes") or ""
+    if notes:
+        parse_note = f"{parse_note} · {notes}"
+    if confidence:
+        parse_note = f"{parse_note} · confidence: {confidence}"
+
+    # Name match via deterministic string comparison — keep the LLM out of
+    # the "is this the same person" decision.
+    name_on_doc = raw.get("name_on_document") or ""
+    status, score, snippet = _match_name(name_on_doc, tenant_name)
+
+    return ExtractionResult(
+        document_date=doc_date,
+        parse_status=parse_status,
+        parse_note=parse_note,
+        name_match_status=status,
+        name_match_score=score,
+        matched_name=snippet or (name_on_doc or None),
+        document_type_predicted=raw.get("document_type"),
+        issuer=raw.get("issuer"),
+        extraction_confidence=confidence,
+        extracted_values_json=json.dumps(raw),
+    )
+
+
+# --- Name matching (deterministic) ----------------------------------------
+
+
+def _normalize(value: str) -> str:
+    return " ".join(value.lower().translate(_PUNCT_TABLE).split())
+
+
+def _match_name(name_on_doc: str, tenant_name: str) -> tuple[str, float | None, str | None]:
+    if not tenant_name.strip():
+        return "unknown", None, None
+    if not name_on_doc.strip():
+        return "no_match", 0.0, None
+
+    norm_doc = _normalize(name_on_doc)
+    norm_tenant = _normalize(tenant_name)
+    if not norm_doc or not norm_tenant:
+        return "no_match", 0.0, None
+
+    if norm_tenant == norm_doc or norm_tenant in norm_doc or norm_doc in norm_tenant:
+        return "match", 1.0, name_on_doc
+
+    # Tokens-based variants (handle "First Last" vs "Last, First" etc.)
+    t_tokens = norm_tenant.split()
+    variants = {norm_tenant}
+    if len(t_tokens) >= 2:
+        variants.add(f"{t_tokens[0]} {t_tokens[-1]}")
+        variants.add(f"{t_tokens[-1]} {t_tokens[0]}")
+
+    best_score = 0.0
+    for v in variants:
+        score = SequenceMatcher(None, v, norm_doc).ratio()
+        if score > best_score:
+            best_score = score
+
+    if best_score >= FUZZY_MATCH:
+        return "fuzzy", round(best_score, 3), name_on_doc
+    if best_score >= PARTIAL_MATCH:
+        return "partial", round(best_score, 3), name_on_doc
+    return "no_match", round(best_score, 3), name_on_doc

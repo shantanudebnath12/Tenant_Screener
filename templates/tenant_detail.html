@@ -125,8 +125,30 @@
             </td>
             <td>
               <span class="pill pill-parse-{{ doc.parse_status }}">{{ doc.parse_status }}</span>
+              {% if doc.extraction_confidence %}
+                <span class="pill pill-conf-{{ doc.extraction_confidence }}">{{ doc.extraction_confidence }}</span>
+              {% endif %}
               {% if doc.parse_note %}
                 <div class="muted small">{{ doc.parse_note }}</div>
+              {% endif %}
+              {% if doc.document_type_predicted and doc.document_type_predicted != doc.doc_type and doc.document_type_predicted != 'unknown' %}
+                <div class="small warn-text">⚠ Model thinks this is a <strong>{{ doc.document_type_predicted | replace('_', ' ') }}</strong>, not the uploaded slot.</div>
+              {% endif %}
+              {% set ev = doc.extracted_values %}
+              {% if ev %}
+                <details class="small extracted-details">
+                  <summary class="muted">Extracted values</summary>
+                  <ul>
+                    {% if ev.issuer %}<li>Issuer: {{ ev.issuer }}</li>{% endif %}
+                    {% if ev.name_on_document %}<li>Name: {{ ev.name_on_document }}</li>{% endif %}
+                    {% if ev.gross_monthly_income %}<li>Gross monthly income: ${{ '%.2f'|format(ev.gross_monthly_income) }}</li>{% endif %}
+                    {% if ev.net_pay_this_period %}<li>Net pay (period): ${{ '%.2f'|format(ev.net_pay_this_period) }} ({{ ev.pay_period or 'unknown period' }})</li>{% endif %}
+                    {% if ev.closing_balance is not none and ev.closing_balance is not undefined %}<li>Closing balance: ${{ '%.2f'|format(ev.closing_balance) }}</li>{% endif %}
+                    {% if ev.average_balance %}<li>Average balance: ${{ '%.2f'|format(ev.average_balance) }}</li>{% endif %}
+                    {% if ev.credit_score %}<li>Credit score: {{ ev.credit_score }}</li>{% endif %}
+                    {% if ev.id_expiration_date %}<li>ID expiration: {{ ev.id_expiration_date }}</li>{% endif %}
+                  </ul>
+                </details>
               {% endif %}
             </td>
             <td class="actions">
