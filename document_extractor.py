@@ -81,11 +81,15 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
             "document_date": {
                 "type": ["string", "null"],
                 "description": (
-                    "The most meaningful date on the document in ISO format "
-                    "(YYYY-MM-DD). For a bank statement use the closing / "
-                    "statement date. For a pay stub use the pay date. For a "
-                    "credit report use the date issued / pulled. For an ID "
-                    "use the issue date (not expiration). Null if not found."
+                    "ISO date (YYYY-MM-DD). Priority by doc type: "
+                    "pay stub — Pay Date / Check Date > Issue Date > Pay Period "
+                    "End (never Pay Period Begin); "
+                    "bank statement — Statement Date / Closing Date / Closing "
+                    "Balance on / Period End (never a transaction date); "
+                    "credit report — Date Issued / Report Date / Date Pulled; "
+                    "ID — Issue Date (NOT expiration); "
+                    "offer letter — letter date, fall back to Start Date. "
+                    "Null if not found."
                 ),
             },
             "date_label": {
@@ -313,22 +317,67 @@ def _call_openai(images: list[tuple[bytes, str]], tenant_name: str) -> dict[str,
     client = OpenAI()
     model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
+    today = date.today().isoformat()
+
     system_prompt = (
-        "You read tenant-screening documents (pay stubs, bank statements, credit "
-        "reports, IDs, offer letters) and extract a strict JSON object. Be "
-        "precise with dates and amounts. Use ISO-8601 (YYYY-MM-DD) for all "
-        "dates. If a field is not clearly present, return null — do not "
-        "guess. If the document is hard to read, set confidence to 'low'."
+        "You extract structured data from tenant-screening documents (pay stubs, "
+        "bank statements, credit reports, government IDs, offer letters) for a "
+        "rental-eligibility app. Accuracy matters — this affects a housing decision.\n"
+        "\n"
+        f"Today's date is {today}. Use ISO-8601 (YYYY-MM-DD) for every date.\n"
+        "\n"
+        "=== Which date goes in `document_date` ===\n"
+        "Documents have several dates. Pick the ONE that best represents when the "
+        "document reflects the applicant's state TODAY. Rules by document type, in "
+        "priority order:\n"
+        "\n"
+        "• PAY STUB: 'Pay Date' or 'Check Date' (preferred) > 'Issue Date' > "
+        "'Pay Period End'. NEVER use 'Pay Period Begin' / 'Period Start'.\n"
+        "• BANK STATEMENT: 'Statement Date' / 'Closing Date' / 'Closing Balance on' / "
+        "'Statement Period End'. NEVER use a transaction date from the activity rows.\n"
+        "• CREDIT REPORT: 'Date Issued' / 'Report Date' / 'Date Pulled' / "
+        "'As of'. Don't use account-open dates.\n"
+        "• GOVERNMENT ID: 'Issue Date' (NOT expiration). Expiration goes in "
+        "`id_expiration_date`.\n"
+        "• OFFER LETTER: the letter's date, or 'Start Date' if no letter date shown.\n"
+        "\n"
+        "Also record the human-readable label you saw next to that date in "
+        "`date_label` (e.g. 'Pay Date', 'Closing Balance on').\n"
+        "\n"
+        "=== Amounts ===\n"
+        "• `gross_monthly_income` (pay stubs only): always normalise to monthly. "
+        "Weekly × 4.333, bi-weekly × 2.1667, semi-monthly × 2, monthly × 1. Use "
+        "GROSS pay (before deductions), not net.\n"
+        "• `net_pay_this_period` (pay stubs): net pay for the CURRENT period, "
+        "unconverted.\n"
+        "• `closing_balance` (bank statements): closing / ending balance. Include "
+        "cents.\n"
+        "• `credit_score` (credit reports): the headline score (FICO / Equifax / "
+        "TransUnion). Integer, 300–900 range.\n"
+        "\n"
+        "=== Name ===\n"
+        "`name_on_document` = primary account holder / employee / licensee, exactly "
+        "as printed. Don't normalise case.\n"
+        "\n"
+        "=== Confidence ===\n"
+        "• 'high' — image is clear, required fields unambiguous.\n"
+        "• 'medium' — image OK but some fields ambiguous, or multiple candidates.\n"
+        "• 'low' — image hard to read, the date you picked is older than ~180 "
+        "days (unusual for screening), or the document_type doesn't match what "
+        "you expected. Explain briefly in `notes`.\n"
+        "\n"
+        "If a field isn't clearly present, return null. Do not guess."
     )
 
     user_content: list[dict[str, Any]] = [
         {
             "type": "text",
             "text": (
-                f"Applicant name (for context only; don't validate here): {tenant_name}\n\n"
-                "Extract the fields defined by the schema. Remember to choose the "
-                "SINGLE most meaningful document date (e.g. closing date for a "
-                "bank statement, pay date for a pay stub)."
+                f"Applicant name (for context only; don't validate here): {tenant_name}\n"
+                f"Today: {today}\n\n"
+                "Extract the fields defined by the schema, following the date-priority "
+                "rules exactly. If you see both 'Pay Period End' and 'Pay Date' on a "
+                "pay stub, you MUST use 'Pay Date'."
             ),
         }
     ]
