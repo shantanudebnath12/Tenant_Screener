@@ -261,3 +261,27 @@ h3 { font-size: 14px; margin: 16px 0 8px; }
 .extracted-details { margin-top: 6px; }
 .extracted-details ul { margin: 4px 0 0 16px; padding: 0; }
 .extracted-details li { margin-bottom: 2px; }
+
+/* Auth pages */
+.auth-body { display: grid; place-items: center; min-height: 100vh; background: var(--bg); }
+.auth-card { max-width: 380px; width: 100%; margin: 32px auto; }
+.auth-form label { display: block; margin-bottom: 10px; }
+.auth-divider {
+  text-align: center;
+  color: var(--muted);
+  margin: 14px 0;
+  position: relative;
+}
+.auth-divider::before,
+.auth-divider::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  width: 40%;
+  height: 1px;
+  background: var(--border);
+}
+.auth-divider::before { left: 0; }
+.auth-divider::after { right: 0; }
+.btn.google { width: 100%; display: block; text-align: center; }
+.user-email { margin: 0 8px 0 12px; }

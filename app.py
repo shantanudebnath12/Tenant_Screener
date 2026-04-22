@@ -1,4 +1,9 @@
-"""Tenant Screener — Flask application."""
+"""Tenant Screener — Flask application.
+
+All state lives in Supabase: Postgres for rows, Storage for uploaded documents,
+Auth for users. Flask is the gatekeeper (every route behind ``@login_required``)
+and runs the OpenAI extraction + eligibility logic.
+"""
 
 from __future__ import annotations
 
@@ -6,60 +11,70 @@ import os
 import uuid
 from datetime import date, datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 from dotenv import load_dotenv
 from flask import (
     Flask,
+    Response,
     abort,
     flash,
+    g,
+    jsonify,
     redirect,
     render_template,
     request,
-    send_from_directory,
     url_for,
 )
 from werkzeug.utils import secure_filename
 
-load_dotenv()  # Load OPENAI_API_KEY and friends from .env before anything else.
+load_dotenv()
 
 import eligibility
+from auth import auth_bp, login_required
 from document_extractor import extract_document
 from models import DOCUMENT_TYPES, Document, Tenant, db
-
+from supabase_client import service_client, storage_bucket
 
 ALLOWED_EXTENSIONS = {"pdf", "png", "jpg", "jpeg", "webp", "doc", "docx"}
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
+SIGNED_URL_TTL_SECONDS = 300  # 5 minutes
 
 
-def create_app(database_uri: str | None = None, upload_dir: str | None = None) -> Flask:
+def create_app(database_uri: str | None = None) -> Flask:
     app = Flask(__name__)
-    base_dir = Path(__file__).parent.resolve()
-    instance_dir = base_dir / "instance"
-    instance_dir.mkdir(exist_ok=True)
 
     app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-only-change-me")
-    app.config["SQLALCHEMY_DATABASE_URI"] = database_uri or f"sqlite:///{instance_dir / 'tenants.db'}"
+    app.config["SQLALCHEMY_DATABASE_URI"] = (
+        database_uri
+        or os.environ.get("DATABASE_URL")
+        or _local_sqlite_fallback()
+    )
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    # PgBouncer transaction-mode doesn't support prepared statements.
+    if app.config["SQLALCHEMY_DATABASE_URI"].startswith(("postgresql", "postgres")):
+        app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+            "connect_args": {"prepare_threshold": None},
+            "pool_pre_ping": True,
+        }
     app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 
-    upload_path = Path(upload_dir) if upload_dir else base_dir / "uploads"
-    upload_path.mkdir(exist_ok=True)
-    app.config["UPLOAD_DIR"] = str(upload_path)
-
     db.init_app(app)
-    with app.app_context():
-        db.create_all()
 
+    app.register_blueprint(auth_bp)
     _register_routes(app)
     _register_template_helpers(app)
     return app
 
 
-# --- Helpers --------------------------------------------------------------
+def _local_sqlite_fallback() -> str:
+    base_dir = Path(__file__).parent.resolve()
+    instance_dir = base_dir / "instance"
+    instance_dir.mkdir(exist_ok=True)
+    return f"sqlite:///{instance_dir / 'tenants.db'}"
 
 
-def _allowed(filename: str) -> bool:
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+# --- Form helpers ---------------------------------------------------------
 
 
 def _parse_date_field(value: str | None) -> date | None:
@@ -114,29 +129,75 @@ def _validate_tenant(t: Tenant) -> list[str]:
     return errors
 
 
-def _delete_file_safely(stored_filename: str, upload_dir: str) -> None:
-    full = Path(upload_dir) / stored_filename
+# --- Storage helpers ------------------------------------------------------
+
+
+def _storage_path(tenant_id: uuid.UUID, filename: str) -> str:
+    safe = secure_filename(filename) or "upload.bin"
+    return f"{tenant_id}/{uuid.uuid4().hex}_{safe}"
+
+
+def _create_signed_upload_url(path: str) -> dict:
+    """Return {token, signed_url, path} via Supabase Storage's signed upload."""
+    bucket = service_client().storage.from_(storage_bucket())
+    resp = bucket.create_signed_upload_url(path)
+    # Shape: {'signed_url': ..., 'token': ..., 'path': ...}
+    return resp
+
+
+def _create_signed_download_url(path: str) -> str | None:
     try:
-        if full.exists():
-            full.unlink()
-    except OSError:
+        bucket = service_client().storage.from_(storage_bucket())
+        resp = bucket.create_signed_url(path, SIGNED_URL_TTL_SECONDS)
+        return resp.get("signedURL") or resp.get("signed_url")
+    except Exception:
+        return None
+
+
+def _download_storage_to_tmp(path: str) -> Path:
+    bucket = service_client().storage.from_(storage_bucket())
+    data = bucket.download(path)
+    suffix = Path(path).suffix or ".bin"
+    tmp = NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(data)
+    tmp.close()
+    return Path(tmp.name)
+
+
+def _delete_storage_object(path: str) -> None:
+    try:
+        service_client().storage.from_(storage_bucket()).remove([path])
+    except Exception:
         pass
 
 
-def _save_and_parse_upload(tenant: Tenant, file, doc_type: str, upload_dir: str) -> Document:
-    original = secure_filename(file.filename)
-    stored = f"{tenant.id}/{uuid.uuid4().hex}_{original}"
-    full_path = Path(upload_dir) / stored
-    full_path.parent.mkdir(parents=True, exist_ok=True)
-    file.save(full_path)
-    size = full_path.stat().st_size
-    result = extract_document(full_path, file.mimetype, tenant.full_name)
+def _allowed(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+# --- Extraction wiring ----------------------------------------------------
+
+
+def _process_uploaded_object(
+    tenant: Tenant, storage_path: str, doc_type: str, original_filename: str, mime_type: str | None
+) -> Document:
+    """Fetch an already-uploaded object from Storage, run extraction, build a
+    Document row ready to be added to the session."""
+    local = _download_storage_to_tmp(storage_path)
+    try:
+        size = local.stat().st_size
+        result = extract_document(local, mime_type, tenant.full_name)
+    finally:
+        try:
+            local.unlink()
+        except OSError:
+            pass
     return Document(
         tenant_id=tenant.id,
         doc_type=doc_type,
-        original_filename=original,
-        stored_filename=stored,
-        mime_type=file.mimetype,
+        original_filename=original_filename,
+        storage_path=storage_path,
+        mime_type=mime_type,
         size_bytes=size,
         parsed_document_date=result.document_date,
         parse_status=result.parse_status,
@@ -152,9 +213,6 @@ def _save_and_parse_upload(tenant: Tenant, file, doc_type: str, upload_dir: str)
 
 
 def _refresh_tenant_from_documents(tenant: Tenant) -> None:
-    """Pull monthly_income / bank_balance / credit_score from the most recent
-    document of each relevant type. Last-upload-wins per type."""
-
     def latest_of(doc_type: str):
         docs = [d for d in tenant.documents if d.doc_type == doc_type]
         return max(docs, key=lambda d: d.uploaded_at) if docs else None
@@ -184,15 +242,27 @@ def _refresh_tenant_from_documents(tenant: Tenant) -> None:
 def _register_routes(app: Flask) -> None:
 
     @app.get("/")
+    @login_required
     def index():
         tenants = Tenant.query.order_by(Tenant.created_at.desc()).all()
         rows = [(t, eligibility.evaluate(t)) for t in tenants]
         return render_template("index.html", rows=rows)
 
     @app.route("/tenants/new", methods=["GET", "POST"])
+    @login_required
     def new_tenant():
         if request.method == "POST":
             tenant = _tenant_from_form(request.form)
+            # The new-applicant page uploads files to a pending UUID before the
+            # tenant exists. Adopt that same UUID so storage paths line up.
+            hint = request.form.get("tenant_id_hint", "").strip()
+            if hint:
+                try:
+                    tenant.id = uuid.UUID(hint)
+                except ValueError:
+                    pass
+            tenant.created_by_user_id = uuid.UUID(g.user.id)
+            tenant.created_by_email = g.user.email
             errors = _validate_tenant(tenant)
             if errors:
                 for e in errors:
@@ -201,38 +271,51 @@ def _register_routes(app: Flask) -> None:
                     "tenant_form.html", tenant=tenant, mode="new", doc_types=DOCUMENT_TYPES
                 )
             db.session.add(tenant)
-            db.session.commit()
+            db.session.flush()  # assign the UUID before we attach documents
+
+            # The form posts a JSON array of {storage_path, doc_type, original_filename, mime_type}
+            # for files the browser already uploaded directly to Storage.
+            uploads_blob = request.form.get("uploads_json", "[]")
+            import json as _json
+
+            try:
+                uploads = _json.loads(uploads_blob)
+            except (TypeError, ValueError):
+                uploads = []
 
             doc_count = 0
-            skipped: list[str] = []
-            for value, label in DOCUMENT_TYPES:
-                file = request.files.get(f"file_{value}")
-                if not file or not file.filename:
+            for item in uploads:
+                try:
+                    doc = _process_uploaded_object(
+                        tenant,
+                        storage_path=item["storage_path"],
+                        doc_type=item.get("doc_type", "other"),
+                        original_filename=item.get("original_filename", "upload.bin"),
+                        mime_type=item.get("mime_type"),
+                    )
+                except Exception:
                     continue
-                if not _allowed(file.filename):
-                    skipped.append(label)
-                    continue
-                doc = _save_and_parse_upload(tenant, file, value, app.config["UPLOAD_DIR"])
                 db.session.add(doc)
                 doc_count += 1
+
             if doc_count:
-                db.session.flush()  # assign doc IDs so the relationship is populated
+                db.session.flush()
                 _refresh_tenant_from_documents(tenant)
-                db.session.commit()
+
+            db.session.commit()
 
             msg = "Applicant created."
             if doc_count:
                 msg += f" {doc_count} document{'s' if doc_count != 1 else ''} uploaded."
             flash(msg, "success")
-            if skipped:
-                flash(f"Skipped unsupported file type for: {', '.join(skipped)}.", "error")
             return redirect(url_for("tenant_detail", tenant_id=tenant.id))
         return render_template(
             "tenant_form.html", tenant=Tenant(), mode="new", doc_types=DOCUMENT_TYPES
         )
 
-    @app.route("/tenants/<int:tenant_id>/edit", methods=["GET", "POST"])
-    def edit_tenant(tenant_id: int):
+    @app.route("/tenants/<uuid:tenant_id>/edit", methods=["GET", "POST"])
+    @login_required
+    def edit_tenant(tenant_id: uuid.UUID):
         tenant = db.session.get(Tenant, tenant_id) or abort(404)
         if request.method == "POST":
             _tenant_from_form(request.form, tenant)
@@ -246,72 +329,117 @@ def _register_routes(app: Flask) -> None:
             return redirect(url_for("tenant_detail", tenant_id=tenant.id))
         return render_template("tenant_form.html", tenant=tenant, mode="edit")
 
-    @app.get("/tenants/<int:tenant_id>")
-    def tenant_detail(tenant_id: int):
+    @app.get("/tenants/<uuid:tenant_id>")
+    @login_required
+    def tenant_detail(tenant_id: uuid.UUID):
         tenant = db.session.get(Tenant, tenant_id) or abort(404)
         verdict = eligibility.evaluate(tenant)
+        download_urls = {
+            str(doc.id): _create_signed_download_url(doc.storage_path) for doc in tenant.documents
+        }
         return render_template(
             "tenant_detail.html",
             tenant=tenant,
             verdict=verdict,
             doc_types=DOCUMENT_TYPES,
+            download_urls=download_urls,
         )
 
-    @app.post("/tenants/<int:tenant_id>/delete")
-    def delete_tenant(tenant_id: int):
+    @app.post("/tenants/<uuid:tenant_id>/delete")
+    @login_required
+    def delete_tenant(tenant_id: uuid.UUID):
         tenant = db.session.get(Tenant, tenant_id) or abort(404)
         for doc in list(tenant.documents):
-            _delete_file_safely(doc.stored_filename, app.config["UPLOAD_DIR"])
+            _delete_storage_object(doc.storage_path)
         db.session.delete(tenant)
         db.session.commit()
         flash("Applicant deleted.", "success")
         return redirect(url_for("index"))
 
-    @app.post("/tenants/<int:tenant_id>/documents")
-    def upload_document(tenant_id: int):
+    @app.post("/tenants/<uuid:tenant_id>/documents/upload-url")
+    @login_required
+    def document_upload_url(tenant_id: uuid.UUID) -> Response:
+        """Ask Flask for a signed URL the browser can PUT a file to directly.
+
+        The tenant doesn't have to exist yet — on the new-applicant page the
+        browser generates a UUID, uploads against it, then submits the form
+        which creates the tenant with that same UUID. The register_document
+        step enforces tenant existence.
+        """
+        payload = request.get_json(silent=True) or {}
+        filename = (payload.get("filename") or "").strip()
+        if not filename or not _allowed(filename):
+            return jsonify({"error": "Unsupported file type."}), 400
+        path = _storage_path(tenant_id, filename)
+        info = _create_signed_upload_url(path)
+        return jsonify(
+            {
+                "storage_path": path,
+                "signed_url": info.get("signed_url"),
+                "token": info.get("token"),
+                "bucket": storage_bucket(),
+            }
+        )
+
+    @app.post("/tenants/<uuid:tenant_id>/documents")
+    @login_required
+    def register_document(tenant_id: uuid.UUID) -> Response:
+        """Called after the browser has uploaded the bytes to Storage."""
         tenant = db.session.get(Tenant, tenant_id) or abort(404)
-        file = request.files.get("file")
-        doc_type = request.form.get("doc_type", "other")
-
-        if not file or not file.filename:
-            flash("No file selected.", "error")
-            return redirect(url_for("tenant_detail", tenant_id=tenant_id))
-        if not _allowed(file.filename):
-            flash("Unsupported file type.", "error")
-            return redirect(url_for("tenant_detail", tenant_id=tenant_id))
-
-        doc = _save_and_parse_upload(tenant, file, doc_type, app.config["UPLOAD_DIR"])
+        payload = request.get_json(silent=True) or {}
+        storage_path = payload.get("storage_path")
+        doc_type = payload.get("doc_type", "other")
+        original_filename = payload.get("original_filename", "upload.bin")
+        mime_type = payload.get("mime_type")
+        if not storage_path:
+            return jsonify({"error": "storage_path required"}), 400
+        doc = _process_uploaded_object(
+            tenant,
+            storage_path=storage_path,
+            doc_type=doc_type,
+            original_filename=original_filename,
+            mime_type=mime_type,
+        )
         db.session.add(doc)
         db.session.flush()
         _refresh_tenant_from_documents(tenant)
         db.session.commit()
-        flash("Document uploaded.", "success")
-        return redirect(url_for("tenant_detail", tenant_id=tenant.id))
+        return jsonify({"ok": True, "document_id": str(doc.id)})
 
-    @app.post("/documents/<int:doc_id>/date")
-    def update_document_date(doc_id: int):
+    @app.post("/documents/<uuid:doc_id>/date")
+    @login_required
+    def update_document_date(doc_id: uuid.UUID):
         doc = db.session.get(Document, doc_id) or abort(404)
         doc.manual_document_date = _parse_date_field(request.form.get("manual_document_date"))
         db.session.commit()
         flash("Document date updated.", "success")
         return redirect(url_for("tenant_detail", tenant_id=doc.tenant_id))
 
-    @app.post("/documents/<int:doc_id>/confirm-name")
-    def confirm_document_name(doc_id: int):
+    @app.post("/documents/<uuid:doc_id>/confirm-name")
+    @login_required
+    def confirm_document_name(doc_id: uuid.UUID):
         doc = db.session.get(Document, doc_id) or abort(404)
         doc.name_manually_confirmed = bool(request.form.get("confirmed"))
         db.session.commit()
         flash("Name confirmation updated.", "success")
         return redirect(url_for("tenant_detail", tenant_id=doc.tenant_id))
 
-    @app.post("/documents/<int:doc_id>/reparse")
-    def reparse_document(doc_id: int):
+    @app.post("/documents/<uuid:doc_id>/reparse")
+    @login_required
+    def reparse_document(doc_id: uuid.UUID):
         doc = db.session.get(Document, doc_id) or abort(404)
-        full_path = Path(app.config["UPLOAD_DIR"]) / doc.stored_filename
-        if not full_path.exists():
-            flash("File missing on disk; cannot re-parse.", "error")
+        try:
+            local = _download_storage_to_tmp(doc.storage_path)
+        except Exception as exc:
+            flash(f"Could not fetch document from storage: {exc}", "error")
             return redirect(url_for("tenant_detail", tenant_id=doc.tenant_id))
-        result = extract_document(full_path, doc.mime_type, doc.tenant.full_name)
+        try:
+            result = extract_document(local, doc.mime_type, doc.tenant.full_name)
+        finally:
+            try:
+                local.unlink()
+            except OSError:
+                pass
         doc.parsed_document_date = result.document_date
         doc.parse_status = result.parse_status
         doc.parse_note = result.parse_note
@@ -327,27 +455,25 @@ def _register_routes(app: Flask) -> None:
         flash("Document re-parsed.", "success")
         return redirect(url_for("tenant_detail", tenant_id=doc.tenant_id))
 
-    @app.post("/documents/<int:doc_id>/delete")
-    def delete_document(doc_id: int):
+    @app.post("/documents/<uuid:doc_id>/delete")
+    @login_required
+    def delete_document(doc_id: uuid.UUID):
         doc = db.session.get(Document, doc_id) or abort(404)
         tenant_id = doc.tenant_id
-        _delete_file_safely(doc.stored_filename, app.config["UPLOAD_DIR"])
+        _delete_storage_object(doc.storage_path)
         db.session.delete(doc)
         db.session.commit()
         flash("Document deleted.", "success")
         return redirect(url_for("tenant_detail", tenant_id=tenant_id))
 
-    @app.get("/documents/<int:doc_id>/download")
-    def download_document(doc_id: int):
+    @app.get("/documents/<uuid:doc_id>/download")
+    @login_required
+    def download_document(doc_id: uuid.UUID):
         doc = db.session.get(Document, doc_id) or abort(404)
-        # send_from_directory protects against path traversal.
-        directory, filename = os.path.split(doc.stored_filename)
-        return send_from_directory(
-            os.path.join(app.config["UPLOAD_DIR"], directory),
-            filename,
-            as_attachment=True,
-            download_name=doc.original_filename,
-        )
+        url = _create_signed_download_url(doc.storage_path)
+        if not url:
+            abort(404)
+        return redirect(url)
 
 
 def _register_template_helpers(app: Flask) -> None:
@@ -365,8 +491,14 @@ def _register_template_helpers(app: Flask) -> None:
         return value.strftime("%b %d, %Y")
 
     @app.context_processor
-    def inject_today():
-        return {"today": date.today()}
+    def inject_globals():
+        return {
+            "today": date.today(),
+            "current_user": getattr(g, "user", None),
+            "supabase_url": os.environ.get("SUPABASE_URL", ""),
+            "supabase_anon_key": os.environ.get("SUPABASE_ANON_KEY", ""),
+            "storage_bucket_name": storage_bucket(),
+        }
 
 
 app = create_app()

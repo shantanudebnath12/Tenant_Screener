@@ -13,6 +13,10 @@
       <nav>
         <a href="{{ url_for('index') }}">Applicants</a>
         <a class="btn primary" href="{{ url_for('new_tenant') }}">+ New applicant</a>
+        {% if current_user %}
+          <span class="muted user-email">{{ current_user.email }}</span>
+          <a class="btn" href="{{ url_for('auth.logout') }}">Sign out</a>
+        {% endif %}
       </nav>
     </div>
   </header>
@@ -29,5 +33,16 @@
     {% endwith %}
     {% block content %}{% endblock %}
   </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+    window.sb = supabase.createClient(
+      {{ supabase_url | tojson }},
+      {{ supabase_anon_key | tojson }},
+      { auth: { persistSession: true, autoRefreshToken: true } },
+    );
+    window.sbBucket = {{ storage_bucket_name | tojson }};
+  </script>
+  {% block scripts %}{% endblock %}
 </body>
 </html>

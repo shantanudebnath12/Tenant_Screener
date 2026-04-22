@@ -6,6 +6,9 @@
   <div>
     <h1>{{ tenant.full_name }}</h1>
     <p class="muted">{{ tenant.email }}{% if tenant.phone %} · {{ tenant.phone }}{% endif %}</p>
+    {% if tenant.created_by_email %}
+      <p class="muted small">Created by {{ tenant.created_by_email }}</p>
+    {% endif %}
   </div>
   <div class="page-header-actions">
     <a class="btn" href="{{ url_for('edit_tenant', tenant_id=tenant.id) }}">Edit</a>
@@ -53,19 +56,19 @@
 
   <section class="card">
     <h2>Upload document</h2>
-    <form method="post" action="{{ url_for('upload_document', tenant_id=tenant.id) }}"
-          enctype="multipart/form-data" class="form upload-form">
+    <form id="upload-form" class="form upload-form">
       <label>Document type
-        <select name="doc_type" required>
+        <select name="doc_type" id="doc_type" required>
           {% for value, label in doc_types %}
             <option value="{{ value }}">{{ label }}</option>
           {% endfor %}
         </select>
       </label>
       <label>File (PDF preferred for date / name parsing)
-        <input type="file" name="file" required>
+        <input type="file" name="file" id="file_input" required>
       </label>
-      <button class="btn primary" type="submit">Upload</button>
+      <button class="btn primary" id="upload-btn" type="submit">Upload</button>
+      <span id="upload-status" class="muted small"></span>
     </form>
   </section>
 </div>
@@ -91,7 +94,12 @@
           <tr>
             <td>{{ doc.type_label }}</td>
             <td>
-              <a href="{{ url_for('download_document', doc_id=doc.id) }}">{{ doc.original_filename }}</a>
+              {% set dl = download_urls.get(doc.id | string) %}
+              {% if dl %}
+                <a href="{{ dl }}" target="_blank" rel="noopener">{{ doc.original_filename }}</a>
+              {% else %}
+                {{ doc.original_filename }}
+              {% endif %}
               <div class="muted small">{{ doc.uploaded_at.strftime('%b %d, %Y %H:%M') }}</div>
             </td>
             <td>
@@ -166,4 +174,59 @@
     </table>
   {% endif %}
 </section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  const tenantId = {{ tenant.id | string | tojson }};
+  const form = document.getElementById("upload-form");
+  const fileInput = document.getElementById("file_input");
+  const docTypeSel = document.getElementById("doc_type");
+  const statusEl = document.getElementById("upload-status");
+  const btn = document.getElementById("upload-btn");
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const file = fileInput.files[0];
+    if (!file) return;
+    btn.disabled = true;
+    statusEl.textContent = "Requesting signed URL…";
+    try {
+      const urlResp = await fetch(`/tenants/${tenantId}/documents/upload-url`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({ filename: file.name }),
+      });
+      if (!urlResp.ok) throw new Error(await urlResp.text());
+      const info = await urlResp.json();
+
+      statusEl.textContent = "Uploading…";
+      const up = await window.sb.storage
+        .from(info.bucket)
+        .uploadToSignedUrl(info.storage_path, info.token, file, {
+          upsert: false, contentType: file.type || undefined,
+        });
+      if (up.error) throw up.error;
+
+      statusEl.textContent = "Processing…";
+      const reg = await fetch(`/tenants/${tenantId}/documents`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({
+          storage_path: info.storage_path,
+          doc_type: docTypeSel.value,
+          original_filename: file.name,
+          mime_type: file.type,
+        }),
+      });
+      if (!reg.ok) throw new Error(await reg.text());
+      window.location.reload();
+    } catch (err) {
+      statusEl.textContent = "Failed: " + (err.message || err);
+      btn.disabled = false;
+    }
+  });
+</script>
 {% endblock %}

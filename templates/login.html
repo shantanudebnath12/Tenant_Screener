@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in — Tenant Screener</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="auth-body">
+  <main class="auth-card">
+    <h1>Tenant Screener</h1>
+    <p class="muted">Sign in with your Tourbee account.</p>
+
+    <div id="flash" class="flash flash-error" hidden></div>
+
+    <form id="login-form" class="form auth-form">
+      <label>Email
+        <input type="email" name="email" autocomplete="username" required>
+      </label>
+      <label>Password
+        <input type="password" name="password" autocomplete="current-password" required>
+      </label>
+      <button type="submit" class="btn primary">Sign in</button>
+    </form>
+
+    <div class="auth-divider"><span>or</span></div>
+
+    <button id="google-btn" class="btn google">Sign in with Google</button>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+    const SUPABASE_URL = {{ supabase_url | tojson }};
+    const SUPABASE_ANON_KEY = {{ supabase_anon_key | tojson }};
+    const NEXT_PATH = {{ next_path | tojson }} || "/";
+
+    const client = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+    const flash = document.getElementById("flash");
+    function showError(msg) {
+      flash.textContent = msg;
+      flash.hidden = false;
+    }
+
+    document.getElementById("login-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      flash.hidden = true;
+      const form = new FormData(e.target);
+      const { error } = await client.auth.signInWithPassword({
+        email: form.get("email"),
+        password: form.get("password"),
+      });
+      if (error) {
+        showError(error.message || "Sign-in failed.");
+        return;
+      }
+      window.location.href = NEXT_PATH;
+    });
+
+    document.getElementById("google-btn").addEventListener("click", async () => {
+      flash.hidden = true;
+      const { error } = await client.auth.signInWithOAuth({
+        provider: "google",
+        options: { redirectTo: window.location.origin + NEXT_PATH },
+      });
+      if (error) showError(error.message || "Google sign-in failed.");
+    });
+  </script>
+</body>
+</html>

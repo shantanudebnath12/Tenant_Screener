@@ -4,7 +4,10 @@
 {% block content %}
 <h1>{{ 'New applicant' if mode == 'new' else 'Edit applicant' }}</h1>
 
-<form method="post" class="card form" enctype="multipart/form-data">
+<form id="tenant-form" method="post" class="card form">
+  <input type="hidden" name="uploads_json" id="uploads_json" value="[]">
+  <input type="hidden" name="tenant_id_hint" id="tenant_id_hint" value="">
+
   <div class="grid-2">
     <label>Full name *
       <input type="text" name="full_name" value="{{ tenant.full_name or '' }}" required>
@@ -57,17 +60,79 @@
         {% for value, label in doc_types %}
           <label class="doc-upload-row">
             <span class="doc-upload-label">{{ label }}</span>
-            <input type="file" name="file_{{ value }}">
+            <input type="file" data-doctype="{{ value }}" class="doc-file-input">
           </label>
         {% endfor %}
       </div>
       <p class="muted small">PDFs are preferred — the system parses the document date and checks that the applicant's name appears in it.</p>
+      <div id="upload-status" class="muted small"></div>
     </fieldset>
   {% endif %}
 
   <div class="form-actions">
-    <button class="btn primary" type="submit">{{ 'Create applicant' if mode == 'new' else 'Save changes' }}</button>
+    <button class="btn primary" id="submit-btn" type="submit">{{ 'Create applicant' if mode == 'new' else 'Save changes' }}</button>
     <a class="btn" href="{{ url_for('tenant_detail', tenant_id=tenant.id) if tenant.id else url_for('index') }}">Cancel</a>
   </div>
 </form>
+{% endblock %}
+
+{% block scripts %}
+{% if mode == 'new' %}
+<script>
+  // Direct-to-Storage uploads, collected client-side, then submitted with the form.
+  const fileInputs = document.querySelectorAll(".doc-file-input");
+  const uploadsField = document.getElementById("uploads_json");
+  const statusEl = document.getElementById("upload-status");
+  const submitBtn = document.getElementById("submit-btn");
+
+  // Applicant id isn't known yet; generate a UUID the browser will use for
+  // both the storage path AND the eventual tenant id (on form submit, the
+  // server adopts this UUID as the tenant's primary key so paths line up).
+  const pendingTenantId = crypto.randomUUID();
+  document.getElementById("tenant_id_hint").value = pendingTenantId;
+
+  async function uploadFile(file, docType) {
+    const resp = await fetch(`/tenants/${pendingTenantId}/documents/upload-url`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ filename: file.name }),
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+    const info = await resp.json();
+    const { error } = await window.sb.storage
+      .from(info.bucket)
+      .uploadToSignedUrl(info.storage_path, info.token, file, {
+        upsert: false, contentType: file.type || undefined,
+      });
+    if (error) throw error;
+    return {
+      storage_path: info.storage_path,
+      doc_type: docType,
+      original_filename: file.name,
+      mime_type: file.type,
+    };
+  }
+
+  document.getElementById("tenant-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    submitBtn.disabled = true;
+    statusEl.textContent = "Uploading documents…";
+    const uploads = [];
+    try {
+      for (const input of fileInputs) {
+        if (!input.files || !input.files[0]) continue;
+        const meta = await uploadFile(input.files[0], input.dataset.doctype);
+        uploads.push(meta);
+      }
+      uploadsField.value = JSON.stringify(uploads);
+      statusEl.textContent = "Creating applicant…";
+      e.target.submit();
+    } catch (err) {
+      statusEl.textContent = "Upload failed: " + (err.message || err);
+      submitBtn.disabled = false;
+    }
+  });
+</script>
+{% endif %}
 {% endblock %}

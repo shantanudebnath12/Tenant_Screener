@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Signing out…</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="auth-body">
+  <main class="auth-card">
+    <p>Signing you out…</p>
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+    const client = supabase.createClient(
+      {{ supabase_url | tojson }},
+      {{ supabase_anon_key | tojson }},
+    );
+    (async () => {
+      await client.auth.signOut();
+      window.location.href = "{{ url_for('auth.login') }}";
+    })();
+  </script>
+</body>
+</html>

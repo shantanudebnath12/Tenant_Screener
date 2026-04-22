@@ -1,5 +1,9 @@
+from __future__ import annotations
+
+import uuid
 from datetime import datetime
 
+import sqlalchemy as sa
 from flask_sqlalchemy import SQLAlchemy
 
 db = SQLAlchemy()
@@ -17,10 +21,16 @@ DOCUMENT_TYPES = [
 DOCUMENT_TYPE_LABELS = dict(DOCUMENT_TYPES)
 
 
+def _uuid_column(*args, **kwargs):
+    # sa.Uuid is Postgres-native UUID + SQLite CHAR(32) fallback — returns
+    # uuid.UUID both ways, so the Python code is dialect-agnostic.
+    return db.Column(sa.Uuid(as_uuid=True), *args, **kwargs)
+
+
 class Tenant(db.Model):
     __tablename__ = "tenants"
 
-    id = db.Column(db.Integer, primary_key=True)
+    id = _uuid_column(primary_key=True, default=uuid.uuid4)
     full_name = db.Column(db.String(200), nullable=False)
     email = db.Column(db.String(200), nullable=False)
     phone = db.Column(db.String(50))
@@ -32,6 +42,10 @@ class Tenant(db.Model):
     target_rent = db.Column(db.Float, nullable=False, default=0.0)
     move_in_date = db.Column(db.Date)
     notes = db.Column(db.Text)
+    # Audit only. References Supabase's auth.users.id. Never used in WHERE
+    # clauses — all authenticated Tourbee users share the same dataset.
+    created_by_user_id = _uuid_column(nullable=True)
+    created_by_email = db.Column(db.String(320))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -46,33 +60,31 @@ class Tenant(db.Model):
 class Document(db.Model):
     __tablename__ = "documents"
 
-    id = db.Column(db.Integer, primary_key=True)
-    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id"), nullable=False)
+    id = _uuid_column(primary_key=True, default=uuid.uuid4)
+    tenant_id = _uuid_column(db.ForeignKey("tenants.id"), nullable=False)
     doc_type = db.Column(db.String(50), nullable=False)
     original_filename = db.Column(db.String(500), nullable=False)
-    stored_filename = db.Column(db.String(500), nullable=False)
+    # Path in the Supabase Storage bucket: "<tenant_id>/<uuid>_<safe_name>".
+    storage_path = db.Column(db.String(700), nullable=False)
     mime_type = db.Column(db.String(100))
     size_bytes = db.Column(db.Integer)
     uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-    # Date extracted from the document contents (most recent date found).
+    # Date extracted from the document contents.
     parsed_document_date = db.Column(db.Date)
-    # User-provided override if parsing is wrong or missing.
     manual_document_date = db.Column(db.Date)
-    parse_status = db.Column(db.String(50), default="pending")  # pending|ok|failed|unsupported
+    parse_status = db.Column(db.String(50), default="pending")
     parse_note = db.Column(db.String(500))
 
-    # Name verification — does the tenant's name appear in the document?
-    name_match_status = db.Column(db.String(20), default="unknown")  # match|fuzzy|partial|no_match|unknown
-    name_match_score = db.Column(db.Float)  # 0.0 – 1.0
-    matched_name = db.Column(db.String(300))  # snippet that matched, for display
+    name_match_status = db.Column(db.String(20), default="unknown")
+    name_match_score = db.Column(db.Float)
+    matched_name = db.Column(db.String(300))
     name_manually_confirmed = db.Column(db.Boolean, default=False)
 
-    # LLM extraction enrichment (null if the extractor didn't run).
-    document_type_predicted = db.Column(db.String(50))  # what the LLM thinks the doc is
-    issuer = db.Column(db.String(200))  # bank / employer / credit bureau
-    extraction_confidence = db.Column(db.String(20))  # high | medium | low
-    extracted_values_json = db.Column(db.Text)  # raw JSON blob from the extractor
+    document_type_predicted = db.Column(db.String(50))
+    issuer = db.Column(db.String(200))
+    extraction_confidence = db.Column(db.String(20))
+    extracted_values_json = db.Column(db.Text)
 
     @property
     def effective_date(self):

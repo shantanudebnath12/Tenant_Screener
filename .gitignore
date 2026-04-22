@@ -12,3 +12,4 @@ uploads/
 .env
 .idea/
 .vscode/
+.vercel/
